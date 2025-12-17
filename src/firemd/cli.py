@@ -1,0 +1,536 @@
+"""CLI entry point for firemd."""
+
+import sys
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from firemd import __version__
+from firemd.config import DEFAULT_API_URL
+from firemd.firecrawl import FirecrawlClient, FirecrawlError
+from firemd.outputs import write_markdown
+from firemd.server import ServerError, ServerManager
+from firemd.util import get_output_dir, is_url, parse_url_file
+
+# Create two apps - one for when URL is provided directly, one for subcommands
+app = typer.Typer(
+    name="firemd",
+    help="Local Firecrawl → Markdown CLI. Convert URLs to Markdown using a locally running Firecrawl instance.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+console = Console()
+
+
+def version_callback(value: bool) -> None:
+    """Print version and exit."""
+    if value:
+        console.print(f"firemd version {__version__}")
+        raise typer.Exit()
+
+
+# Server subcommand group
+server_app = typer.Typer(help="Manage the local Firecrawl server.")
+app.add_typer(server_app, name="server")
+
+
+@server_app.command("install")
+def server_install(
+    force: bool = typer.Option(False, "--force", "-f", help="Force reinstall"),
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+) -> None:
+    """Install/provision Firecrawl locally (clone repo, configure)."""
+    try:
+        manager = ServerManager(api_url=api_url)
+        manager.install(force=force)
+    except ServerError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(2)
+
+
+@server_app.command("up")
+def server_up(
+    build: bool = typer.Option(True, "--build/--no-build", help="Build images before starting"),
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+) -> None:
+    """Start the Firecrawl server."""
+    try:
+        manager = ServerManager(api_url=api_url)
+        manager.up(build=build)
+    except ServerError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(2)
+
+
+@server_app.command("stop")
+def server_stop(
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+) -> None:
+    """Stop the Firecrawl server (containers remain for fast restart)."""
+    try:
+        manager = ServerManager(api_url=api_url)
+        manager.stop()
+    except ServerError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(2)
+
+
+@server_app.command("down")
+def server_down(
+    volumes: bool = typer.Option(False, "--volumes", "-v", help="Also remove volumes"),
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+) -> None:
+    """Stop and remove Firecrawl containers."""
+    try:
+        manager = ServerManager(api_url=api_url)
+        manager.down(remove_volumes=volumes)
+    except ServerError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(2)
+
+
+@server_app.command("status")
+def server_status(
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+) -> None:
+    """Show Firecrawl server status."""
+    manager = ServerManager(api_url=api_url)
+    status = manager.status()
+
+    table = Table(title="Firecrawl Server Status")
+    table.add_column("Property", style="cyan")
+    table.add_column("Value")
+
+    def status_icon(ok: bool) -> str:
+        return "[green]✓[/green]" if ok else "[red]✗[/red]"
+
+    table.add_row("Installed", status_icon(status.installed))
+    table.add_row("Containers exist", status_icon(status.containers_exist))
+    table.add_row("Containers running", status_icon(status.containers_running))
+    table.add_row("API reachable", status_icon(status.api_reachable))
+    table.add_row("API URL", status.api_url)
+
+    console.print(table)
+
+    if status.is_ready:
+        console.print("\n[green]Server is ready![/green]")
+    elif status.installed:
+        console.print("\n[yellow]Server installed but not running. Use 'firemd server up' to start.[/yellow]")
+    else:
+        console.print("\n[yellow]Server not installed. Use 'firemd server install' first.[/yellow]")
+
+
+@server_app.command("logs")
+def server_logs(
+    follow: bool = typer.Option(False, "--follow", "-f", help="Follow log output"),
+    tail: int = typer.Option(None, "--tail", "-n", help="Number of lines to show"),
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+) -> None:
+    """Show Firecrawl server logs."""
+    try:
+        manager = ServerManager(api_url=api_url)
+        manager.logs(follow=follow, tail=tail)
+    except ServerError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(2)
+
+
+@server_app.command("doctor")
+def server_doctor(
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+) -> None:
+    """Run diagnostics on the Firecrawl server setup."""
+    import shutil
+    import socket
+    import subprocess
+    from urllib.parse import urlparse
+
+    from firemd.config import DEFAULT_API_PORT, get_firecrawl_dir
+
+    console.print("[bold]Running firemd diagnostics...[/bold]\n")
+    all_ok = True
+
+    # Check 1: Docker installed
+    docker_path = shutil.which("docker")
+    if docker_path:
+        console.print("[green]✓[/green] Docker found: " + docker_path)
+    else:
+        console.print("[red]✗[/red] Docker not found in PATH")
+        console.print("  [dim]Install Docker: https://docs.docker.com/get-docker/[/dim]")
+        all_ok = False
+
+    # Check 2: Docker daemon running
+    if docker_path:
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                console.print("[green]✓[/green] Docker daemon is running")
+            else:
+                console.print("[red]✗[/red] Docker daemon not running")
+                console.print("  [dim]Start Docker or OrbStack[/dim]")
+                all_ok = False
+        except subprocess.TimeoutExpired:
+            console.print("[red]✗[/red] Docker daemon check timed out")
+            all_ok = False
+        except Exception as e:
+            console.print(f"[red]✗[/red] Docker check failed: {e}")
+            all_ok = False
+
+    # Check 3: Docker Compose version
+    if docker_path:
+        try:
+            result = subprocess.run(
+                ["docker", "compose", "version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                version_line = result.stdout.strip()
+                console.print(f"[green]✓[/green] Docker Compose: {version_line}")
+            else:
+                console.print("[yellow]![/yellow] Docker Compose v2 not available")
+                console.print("  [dim]firemd requires 'docker compose' (v2)[/dim]")
+                all_ok = False
+        except Exception:
+            console.print("[yellow]![/yellow] Could not check Docker Compose version")
+            all_ok = False
+
+    # Check 4: Git installed
+    git_path = shutil.which("git")
+    if git_path:
+        console.print("[green]✓[/green] Git found: " + git_path)
+    else:
+        console.print("[red]✗[/red] Git not found in PATH")
+        console.print("  [dim]Git is needed for 'firemd server install'[/dim]")
+        all_ok = False
+
+    # Check 5: Firecrawl installation
+    firecrawl_dir = get_firecrawl_dir()
+    if firecrawl_dir.exists():
+        console.print(f"[green]✓[/green] Firecrawl installed: {firecrawl_dir}")
+
+        # Check .env exists
+        env_file = firecrawl_dir / ".env"
+        if env_file.exists():
+            console.print("[green]✓[/green] Configuration file (.env) exists")
+        else:
+            console.print("[yellow]![/yellow] Configuration file (.env) missing")
+            console.print("  [dim]Run 'firemd server install' to create it[/dim]")
+    else:
+        console.print("[yellow]![/yellow] Firecrawl not installed")
+        console.print(f"  [dim]Run 'firemd server install' to set up at {firecrawl_dir}[/dim]")
+
+    # Check 6: Port availability
+    parsed = urlparse(api_url)
+    port = parsed.port or DEFAULT_API_PORT
+    host = parsed.hostname or "127.0.0.1"
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    try:
+        result = sock.connect_ex((host, port))
+        if result == 0:
+            # Port is in use - check if it's Firecrawl
+            manager = ServerManager(api_url=api_url)
+            if manager._check_api_health():
+                console.print(f"[green]✓[/green] Firecrawl API responding on port {port}")
+            else:
+                console.print(f"[yellow]![/yellow] Port {port} is in use but not by Firecrawl")
+                console.print("  [dim]Another service may be using this port[/dim]")
+        else:
+            console.print(f"[dim]○[/dim] Port {port} is available (server not running)")
+    except socket.error as e:
+        console.print(f"[yellow]![/yellow] Could not check port {port}: {e}")
+    finally:
+        sock.close()
+
+    # Summary
+    console.print()
+    if all_ok:
+        console.print("[green]All checks passed![/green]")
+    else:
+        console.print("[yellow]Some issues found. See above for details.[/yellow]")
+
+
+def scrape_single_url(
+    url: str,
+    output_dir: Path,
+    front_matter: bool,
+    verbose: bool,
+    client: FirecrawlClient,
+) -> bool:
+    """Scrape a single URL.
+
+    Returns:
+        True if successful, False otherwise
+    """
+    console.print(f"[cyan]Scraping:[/cyan] {url}")
+
+    result = client.scrape_url(url)
+
+    if not result.success:
+        console.print(f"[red]Failed:[/red] {result.error}")
+        return False
+
+    filepath = write_markdown(output_dir, result, front_matter=front_matter)
+    console.print(f"[green]✓ Saved:[/green] {filepath}")
+
+    if verbose and result.title:
+        console.print(f"  [dim]Title: {result.title}[/dim]")
+
+    return True
+
+
+def do_scrape(
+    input_: str,
+    out: Optional[str],
+    front_matter: bool,
+    verbose: bool,
+    api_url: str,
+    overwrite: bool,
+    server: str,
+    lifecycle: str,
+) -> None:
+    """Execute the scrape operation."""
+    # Determine if input is URL or file
+    if is_url(input_):
+        urls = [input_]
+        is_batch = False
+    else:
+        # It's a file path
+        input_path = Path(input_)
+        if not input_path.exists():
+            console.print(f"[red]Error:[/red] File not found: {input_}")
+            raise typer.Exit(2)
+        urls = parse_url_file(input_path)
+        is_batch = True
+        if not urls:
+            console.print(f"[red]Error:[/red] No URLs found in {input_}")
+            raise typer.Exit(2)
+
+    # Determine output directory
+    output_dir = get_output_dir(input_, out)
+
+    if verbose:
+        console.print(f"[dim]Output directory: {output_dir}[/dim]")
+        console.print(f"[dim]URLs to process: {len(urls)}[/dim]")
+
+    # Handle server lifecycle
+    manager = ServerManager(api_url=api_url)
+    we_started_server = False
+
+    try:
+        if server == "never":
+            # Require server to be running
+            status = manager.status()
+            if not status.api_reachable:
+                console.print("[red]Error:[/red] Server not reachable and --server=never specified")
+                raise typer.Exit(2)
+        else:
+            # auto or always - ensure server is running
+            try:
+                we_started_server = manager.ensure()
+            except ServerError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                raise typer.Exit(2)
+
+        # Create client and scrape
+        success_count = 0
+        fail_count = 0
+
+        with FirecrawlClient(api_url=api_url) as client:
+            if is_batch:
+                # Batch mode - import and use batch scraping
+                from firemd.manifest import load_manifest, save_manifest_entry, ManifestEntry
+
+                # Load existing manifest for resume (default behavior)
+                manifest_path = output_dir / "manifest.jsonl"
+                existing_manifest = {}
+                if not overwrite and manifest_path.exists():
+                    existing_manifest = load_manifest(manifest_path)
+                    if verbose:
+                        console.print(f"[dim]Loaded {len(existing_manifest)} existing entries from manifest[/dim]")
+
+                # Filter URLs unless overwriting
+                if not overwrite:
+                    urls_to_process = [u for u in urls if u not in existing_manifest or existing_manifest[u].status != "ok"]
+                    skipped = len(urls) - len(urls_to_process)
+                    if skipped > 0:
+                        console.print(f"[dim]Skipping {skipped} already processed URLs (use --overwrite to re-scrape)[/dim]")
+                    urls = urls_to_process
+
+                if not urls:
+                    console.print("[green]All URLs already processed![/green]")
+                    raise typer.Exit(0)
+
+                # Use batch scraping with progress
+                from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+
+                try:
+                    job = client.batch_scrape(urls)
+                    console.print(f"[cyan]Started batch job:[/cyan] {job.job_id}")
+
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TaskProgressColumn(),
+                        console=console,
+                    ) as progress:
+                        task = progress.add_task("Scraping...", total=job.total)
+
+                        for job_status, results in client.poll_batch(job.job_id):
+                            # Update progress
+                            progress.update(task, completed=job_status.completed)
+
+                            # Process new results
+                            for i, result in enumerate(results):
+                                # Find index in original URL list
+                                try:
+                                    url_index = urls.index(result.url) + 1
+                                except ValueError:
+                                    url_index = success_count + fail_count + 1
+
+                                if result.success:
+                                    filepath = write_markdown(
+                                        output_dir,
+                                        result,
+                                        index=url_index,
+                                        front_matter=front_matter,
+                                    )
+                                    success_count += 1
+                                    entry = ManifestEntry(
+                                        url=result.url,
+                                        file=filepath.name,
+                                        status="ok",
+                                        title=result.title,
+                                        http_status=result.status_code,
+                                    )
+                                else:
+                                    fail_count += 1
+                                    entry = ManifestEntry(
+                                        url=result.url,
+                                        file="",
+                                        status="error",
+                                        error=result.error,
+                                    )
+
+                                save_manifest_entry(manifest_path, entry)
+
+                except FirecrawlError as e:
+                    # Fallback to per-URL scraping if batch fails
+                    console.print(f"[yellow]Batch scraping failed, falling back to per-URL mode:[/yellow] {e}")
+                    for i, url in enumerate(urls, 1):
+                        if scrape_single_url(url, output_dir, front_matter, verbose, client):
+                            success_count += 1
+                        else:
+                            fail_count += 1
+            else:
+                # Single URL mode
+                if scrape_single_url(urls[0], output_dir, front_matter, verbose, client):
+                    success_count = 1
+                else:
+                    fail_count = 1
+
+        # Print summary for batch
+        if is_batch:
+            console.print()
+            console.print(f"[green]Completed:[/green] {success_count} succeeded, {fail_count} failed")
+
+        # Determine exit code
+        if fail_count > 0 and success_count == 0:
+            exit_code = 2
+        elif fail_count > 0:
+            exit_code = 1
+        else:
+            exit_code = 0
+
+    finally:
+        # Handle server lifecycle
+        if we_started_server and lifecycle != "keep" and server != "always":
+            if lifecycle == "down":
+                manager.down()
+            else:  # stop (default)
+                manager.stop()
+
+    raise typer.Exit(exit_code)
+
+
+@app.callback()
+def callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        callback=version_callback,
+        is_eager=True,
+        help="Show version and exit.",
+    ),
+) -> None:
+    """Convert URLs to Markdown using local Firecrawl."""
+    pass
+
+
+@app.command()
+def scrape(
+    input_: str = typer.Argument(..., metavar="INPUT", help="URL or path to file containing URLs"),
+    out: Optional[str] = typer.Option(None, "--out", "-o", help="Output directory"),
+    front_matter: bool = typer.Option(False, "--front-matter", help="Add YAML front matter"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    api_url: str = typer.Option(DEFAULT_API_URL, "--api", help="API URL"),
+    overwrite: bool = typer.Option(False, "--overwrite", "-f", help="Re-scrape URLs even if already in manifest"),
+    server: str = typer.Option(
+        "auto",
+        "--server",
+        help="Server policy: auto (start if needed), never (require running), always (keep running after)",
+    ),
+    lifecycle: str = typer.Option(
+        "stop",
+        "--lifecycle",
+        help="After scrape: stop (stop containers), down (remove containers), keep (leave running)",
+    ),
+) -> None:
+    """Scrape URL(s) and convert to Markdown.
+
+    INPUT can be a single URL or a path to a file containing URLs (one per line).
+
+    Examples:
+      firemd scrape https://example.com
+      firemd scrape urls.txt --front-matter
+    """
+    do_scrape(
+        input_=input_,
+        out=out,
+        front_matter=front_matter,
+        verbose=verbose,
+        api_url=api_url,
+        overwrite=overwrite,
+        server=server,
+        lifecycle=lifecycle,
+    )
+
+
+def main() -> None:
+    """Main entry point that handles both direct URL input and subcommands."""
+    # Check if first arg looks like a URL or file (not a subcommand or option)
+    if len(sys.argv) > 1:
+        first_arg = sys.argv[1]
+        # If it's not an option and not a known subcommand, treat as scrape input
+        if not first_arg.startswith("-") and first_arg not in ("server", "scrape"):
+            # Insert 'scrape' command before the input
+            sys.argv.insert(1, "scrape")
+
+    app()
+
+
+if __name__ == "__main__":
+    main()
