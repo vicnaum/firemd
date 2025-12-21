@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,8 +15,42 @@ from firemd.config import DEFAULT_API_URL
 T = TypeVar("T")
 
 
-# HTTP status codes that should trigger a retry
+# HTTP status codes that should trigger a retry (used by with_retry for API calls)
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
+def is_permanent_error(status_code: int | None) -> bool:
+    """Check if an HTTP status code represents a permanent error that should NOT be retried.
+
+    Permanent errors are 4xx client errors (except 408 Request Timeout and 429 Too Many Requests).
+    These indicate issues that won't resolve with retrying (e.g., 404 Not Found, 403 Forbidden).
+
+    Args:
+        status_code: HTTP status code, or None for network errors
+
+    Returns:
+        True if the error is permanent and should not be retried
+    """
+    if status_code is None:
+        return False  # Network error - should retry
+    # 4xx are permanent EXCEPT 408 (timeout) and 429 (rate limit)
+    if 400 <= status_code < 500 and status_code not in {408, 429}:
+        return True
+    return False  # 5xx, 408, 429, unknown = retry
+
+
+def is_success(status_code: int | None) -> bool:
+    """Check if an HTTP status code indicates success (2xx).
+
+    Args:
+        status_code: HTTP status code, or None
+
+    Returns:
+        True if status code is in the 2xx range
+    """
+    if status_code is None:
+        return False
+    return 200 <= status_code < 300
 
 
 def with_retry(
@@ -79,8 +114,8 @@ class ScrapeResult:
 
     @property
     def success(self) -> bool:
-        """Check if scrape was successful."""
-        return self.error is None and bool(self.markdown)
+        """Check if scrape was successful (2xx status and has content)."""
+        return is_success(self.status_code) and bool(self.markdown)
 
 
 @dataclass
@@ -336,3 +371,64 @@ class FirecrawlClient:
                 break
 
             time.sleep(poll_interval)
+
+    def scrape_urls_sequential(
+        self,
+        urls: list[str],
+        delay: float = 1.0,
+        max_retries: int = 5,
+        max_backoff: float = 32.0,
+        on_retry: Callable[[str, int, int | None], None] | None = None,
+    ) -> Iterator[tuple[ScrapeResult, bool, int]]:
+        """Scrape URLs sequentially with retry logic for transient errors.
+
+        This method processes URLs one at a time, implementing exponential backoff
+        for retryable errors (429, 5xx, network errors) while immediately failing
+        on permanent errors (4xx except 408/429).
+
+        Args:
+            urls: List of URLs to scrape
+            delay: Maximum delay in seconds between requests (actual delay is random 0 to delay)
+            max_retries: Maximum retry attempts for retryable errors
+            max_backoff: Maximum backoff delay in seconds
+            on_retry: Optional callback(url, attempt, status_code) called on each retry
+
+        Yields:
+            Tuple of (ScrapeResult, is_permanent_error, retry_count)
+            - ScrapeResult: The scrape result (success or failure)
+            - is_permanent_error: True if error is permanent (no point retrying later)
+            - retry_count: Number of retries attempted (0 = succeeded first try)
+        """
+        for i, url in enumerate(urls):
+            result: ScrapeResult | None = None
+            permanent = False
+            retry_count = 0
+
+            for attempt in range(max_retries + 1):
+                result = self.scrape_url(url)
+
+                # Check if successful (2xx status code)
+                if result.success:
+                    break
+
+                # Check if permanent error (4xx except 408, 429)
+                if is_permanent_error(result.status_code):
+                    permanent = True
+                    break
+
+                # Retryable error - apply backoff if we have retries left
+                if attempt < max_retries:
+                    retry_count = attempt + 1
+                    backoff = min(1.0 * (2 ** attempt), max_backoff)
+                    if on_retry:
+                        on_retry(url, retry_count, result.status_code)
+                    time.sleep(backoff)
+                # else: exhausted retries, will yield the failed result
+
+            # Yield the result
+            if result is not None:
+                yield result, permanent, retry_count
+
+            # Random politeness delay before next URL (but not after the last one)
+            if i < len(urls) - 1 and delay > 0:
+                time.sleep(random.uniform(0, delay))

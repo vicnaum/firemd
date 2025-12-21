@@ -10,7 +10,8 @@ from rich.table import Table
 
 from firemd import __version__
 from firemd.config import DEFAULT_API_URL
-from firemd.firecrawl import FirecrawlClient, FirecrawlError
+from firemd.firecrawl import FirecrawlClient, FirecrawlError, is_permanent_error, is_success
+from firemd.manifest import ManifestEntry, load_manifest, save_error_entry, save_manifest_entry
 from firemd.outputs import write_markdown
 from firemd.server import ServerError, ServerManager
 from firemd.util import get_output_dir, is_url, parse_url_file
@@ -299,12 +300,20 @@ def do_scrape(
     overwrite: bool,
     server: str,
     lifecycle: str,
+    batch_mode: bool,
+    delay: float,
+    max_retries: int,
+    max_backoff: float,
 ) -> None:
     """Execute the scrape operation."""
+    import time
+
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+
     # Determine if input is URL or file
     if is_url(input_):
         urls = [input_]
-        is_batch = False
+        is_multi = False
     else:
         # It's a file path
         input_path = Path(input_)
@@ -312,7 +321,7 @@ def do_scrape(
             console.print(f"[red]Error:[/red] File not found: {input_}")
             raise typer.Exit(2)
         urls = parse_url_file(input_path)
-        is_batch = True
+        is_multi = True
         if not urls:
             console.print(f"[red]Error:[/red] No URLs found in {input_}")
             raise typer.Exit(2)
@@ -346,23 +355,29 @@ def do_scrape(
         # Create client and scrape
         success_count = 0
         fail_count = 0
+        permanent_fail_count = 0
+
+        # Set up paths
+        manifest_path = output_dir / "manifest.jsonl"
+        errors_path = output_dir / "errors.jsonl"
 
         with FirecrawlClient(api_url=api_url) as client:
-            if is_batch:
-                # Batch mode - import and use batch scraping
-                from firemd.manifest import load_manifest, save_manifest_entry, ManifestEntry
-
+            if is_multi:
                 # Load existing manifest for resume (default behavior)
-                manifest_path = output_dir / "manifest.jsonl"
                 existing_manifest = {}
                 if not overwrite and manifest_path.exists():
                     existing_manifest = load_manifest(manifest_path)
                     if verbose:
                         console.print(f"[dim]Loaded {len(existing_manifest)} existing entries from manifest[/dim]")
 
-                # Filter URLs unless overwriting
+                # Filter URLs unless overwriting - only skip successful (2xx) entries
                 if not overwrite:
-                    urls_to_process = [u for u in urls if u not in existing_manifest or existing_manifest[u].status != "ok"]
+                    urls_to_process = [
+                        u for u in urls
+                        if u not in existing_manifest
+                        or existing_manifest[u].status != "ok"
+                        or not is_success(existing_manifest[u].http_status)
+                    ]
                     skipped = len(urls) - len(urls_to_process)
                     if skipped > 0:
                         console.print(f"[dim]Skipping {skipped} already processed URLs (use --overwrite to re-scrape)[/dim]")
@@ -372,12 +387,28 @@ def do_scrape(
                     console.print("[green]All URLs already processed![/green]")
                     raise typer.Exit(0)
 
-                # Use batch scraping with progress
-                from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+                # Create URL to index mapping for consistent file naming
+                url_to_index = {url: i + 1 for i, url in enumerate(urls)}
 
-                try:
-                    job = client.batch_scrape(urls)
-                    console.print(f"[cyan]Started batch job:[/cyan] {job.job_id}")
+                if batch_mode:
+                    # Old batch mode (for users with proxy infrastructure)
+                    success_count, fail_count = _do_batch_scrape(
+                        client=client,
+                        urls=urls,
+                        output_dir=output_dir,
+                        manifest_path=manifest_path,
+                        front_matter=front_matter,
+                        url_to_index=url_to_index,
+                    )
+                else:
+                    # Sequential mode (default) - with retry logic
+                    retryable_failures: list[tuple[str, int]] = []  # (url, index)
+
+                    total_retries = 0
+
+                    def on_retry(url: str, attempt: int, status_code: int | None) -> None:
+                        if verbose:
+                            console.print(f"  [yellow]Retry {attempt}:[/yellow] {url} (HTTP {status_code})")
 
                     with Progress(
                         SpinnerColumn(),
@@ -386,28 +417,102 @@ def do_scrape(
                         TaskProgressColumn(),
                         console=console,
                     ) as progress:
-                        task = progress.add_task("Scraping...", total=job.total)
+                        task = progress.add_task("Scraping...", total=len(urls))
 
-                        for job_status, results in client.poll_batch(job.job_id):
-                            # Update progress
-                            progress.update(task, completed=job_status.completed)
+                        for result, is_perm_error, retry_count in client.scrape_urls_sequential(
+                            urls,
+                            delay=delay,
+                            max_retries=max_retries,
+                            max_backoff=max_backoff,
+                            on_retry=on_retry if verbose else None,
+                        ):
+                            total_retries += retry_count
+                            url_index = url_to_index.get(result.url, success_count + fail_count + 1)
 
-                            # Process new results
-                            for i, result in enumerate(results):
-                                # Find index in original URL list
-                                try:
-                                    url_index = urls.index(result.url) + 1
-                                except ValueError:
-                                    url_index = success_count + fail_count + 1
+                            if result.success:
+                                # Success - save markdown and manifest entry
+                                filepath = write_markdown(
+                                    output_dir,
+                                    result,
+                                    index=url_index,
+                                    front_matter=front_matter,
+                                )
+                                success_count += 1
+                                entry = ManifestEntry(
+                                    url=result.url,
+                                    file=filepath.name,
+                                    status="ok",
+                                    title=result.title,
+                                    http_status=result.status_code,
+                                )
+                                save_manifest_entry(manifest_path, entry)
+                            else:
+                                # Failed
+                                fail_count += 1
+                                error_msg = result.error or f"HTTP {result.status_code}"
+                                entry = ManifestEntry(
+                                    url=result.url,
+                                    file="",
+                                    status="error",
+                                    http_status=result.status_code,
+                                    error=error_msg,
+                                )
+                                save_manifest_entry(manifest_path, entry)
+
+                                if is_perm_error:
+                                    # Permanent error - save to errors.jsonl immediately
+                                    permanent_fail_count += 1
+                                    save_error_entry(errors_path, entry)
+                                    if verbose:
+                                        console.print(f"  [red]Permanent error:[/red] {result.url} ({error_msg})")
+                                else:
+                                    # Retryable error - add to list for end-of-run retry
+                                    retryable_failures.append((result.url, url_index))
+                                    if verbose:
+                                        console.print(f"  [yellow]Will retry:[/yellow] {result.url} ({error_msg})")
+
+                            progress.update(task, advance=1)
+
+                    # End-of-run retry for retryable failures
+                    if retryable_failures:
+                        console.print(f"\n[cyan]Retrying {len(retryable_failures)} failed URLs after 30s cooldown...[/cyan]")
+                        time.sleep(30)
+
+                        retry_success = 0
+                        retry_fail = 0
+
+                        with Progress(
+                            SpinnerColumn(),
+                            TextColumn("[progress.description]{task.description}"),
+                            BarColumn(),
+                            TaskProgressColumn(),
+                            console=console,
+                        ) as progress:
+                            task = progress.add_task("Retrying...", total=len(retryable_failures))
+
+                            retry_urls = [url for url, _ in retryable_failures]
+                            retry_index_map = {url: idx for url, idx in retryable_failures}
+
+                            for result, is_perm_error, retry_count in client.scrape_urls_sequential(
+                                retry_urls,
+                                delay=delay,
+                                max_retries=max_retries,
+                                max_backoff=max_backoff,
+                                on_retry=on_retry if verbose else None,
+                            ):
+                                url_index = retry_index_map.get(result.url, 0)
 
                                 if result.success:
+                                    # Success on retry
                                     filepath = write_markdown(
                                         output_dir,
                                         result,
                                         index=url_index,
                                         front_matter=front_matter,
                                     )
+                                    retry_success += 1
                                     success_count += 1
+                                    fail_count -= 1  # Remove from fail count
                                     entry = ManifestEntry(
                                         url=result.url,
                                         file=filepath.name,
@@ -415,25 +520,28 @@ def do_scrape(
                                         title=result.title,
                                         http_status=result.status_code,
                                     )
+                                    save_manifest_entry(manifest_path, entry)
                                 else:
-                                    fail_count += 1
+                                    # Still failed - save to errors.jsonl
+                                    retry_fail += 1
+                                    error_msg = result.error or f"HTTP {result.status_code}"
                                     entry = ManifestEntry(
                                         url=result.url,
                                         file="",
                                         status="error",
-                                        error=result.error,
+                                        http_status=result.status_code,
+                                        error=error_msg,
                                     )
+                                    save_error_entry(errors_path, entry)
 
-                                save_manifest_entry(manifest_path, entry)
+                                progress.update(task, advance=1)
 
-                except FirecrawlError as e:
-                    # Fallback to per-URL scraping if batch fails
-                    console.print(f"[yellow]Batch scraping failed, falling back to per-URL mode:[/yellow] {e}")
-                    for i, url in enumerate(urls, 1):
-                        if scrape_single_url(url, output_dir, front_matter, verbose, client):
-                            success_count += 1
-                        else:
-                            fail_count += 1
+                        console.print(f"[dim]Retry results: {retry_success} succeeded, {retry_fail} still failed[/dim]")
+
+                    # Show retry stats if any retries happened
+                    if verbose and total_retries > 0:
+                        console.print(f"[dim]Total retries during scraping: {total_retries}[/dim]")
+
             else:
                 # Single URL mode
                 if scrape_single_url(urls[0], output_dir, front_matter, verbose, client):
@@ -441,10 +549,15 @@ def do_scrape(
                 else:
                     fail_count = 1
 
-        # Print summary for batch
-        if is_batch:
+        # Print summary for multi-URL mode
+        if is_multi:
             console.print()
-            console.print(f"[green]Completed:[/green] {success_count} succeeded, {fail_count} failed")
+            if permanent_fail_count > 0:
+                console.print(f"[green]Completed:[/green] {success_count} succeeded, {fail_count} failed ({permanent_fail_count} permanent)")
+            else:
+                console.print(f"[green]Completed:[/green] {success_count} succeeded, {fail_count} failed")
+            if fail_count > 0:
+                console.print(f"[dim]Failed URLs saved to: {errors_path}[/dim]")
 
         # Determine exit code
         if fail_count > 0 and success_count == 0:
@@ -463,6 +576,79 @@ def do_scrape(
                 manager.stop()
 
     raise typer.Exit(exit_code)
+
+
+def _do_batch_scrape(
+    client: FirecrawlClient,
+    urls: list[str],
+    output_dir: Path,
+    manifest_path: Path,
+    front_matter: bool,
+    url_to_index: dict[str, int],
+) -> tuple[int, int]:
+    """Execute batch scraping (old behavior).
+
+    Returns:
+        Tuple of (success_count, fail_count)
+    """
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+
+    success_count = 0
+    fail_count = 0
+
+    try:
+        job = client.batch_scrape(urls)
+        console.print(f"[cyan]Started batch job:[/cyan] {job.job_id}")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Scraping...", total=job.total)
+
+            for job_status, results in client.poll_batch(job.job_id):
+                # Update progress
+                progress.update(task, completed=job_status.completed)
+
+                # Process new results
+                for result in results:
+                    url_index = url_to_index.get(result.url, success_count + fail_count + 1)
+
+                    if result.success:
+                        filepath = write_markdown(
+                            output_dir,
+                            result,
+                            index=url_index,
+                            front_matter=front_matter,
+                        )
+                        success_count += 1
+                        entry = ManifestEntry(
+                            url=result.url,
+                            file=filepath.name,
+                            status="ok",
+                            title=result.title,
+                            http_status=result.status_code,
+                        )
+                    else:
+                        fail_count += 1
+                        entry = ManifestEntry(
+                            url=result.url,
+                            file="",
+                            status="error",
+                            http_status=result.status_code,
+                            error=result.error,
+                        )
+
+                    save_manifest_entry(manifest_path, entry)
+
+    except FirecrawlError as e:
+        console.print(f"[red]Batch scraping failed:[/red] {e}")
+        raise typer.Exit(2)
+
+    return success_count, fail_count
 
 
 @app.callback()
@@ -498,14 +684,39 @@ def scrape(
         "--lifecycle",
         help="After scrape: stop (stop containers), down (remove containers), keep (leave running)",
     ),
+    batch: bool = typer.Option(
+        False,
+        "--batch",
+        help="Use batch mode (faster but may trigger rate limits)",
+    ),
+    delay: float = typer.Option(
+        1.0,
+        "--delay",
+        help="Max delay in seconds between requests, actual is random 0 to delay (sequential mode only)",
+    ),
+    max_retries: int = typer.Option(
+        5,
+        "--max-retries",
+        help="Maximum retry attempts for retryable errors (sequential mode only)",
+    ),
+    max_backoff: float = typer.Option(
+        32.0,
+        "--max-backoff",
+        help="Maximum backoff delay in seconds (sequential mode only)",
+    ),
 ) -> None:
     """Scrape URL(s) and convert to Markdown.
 
     INPUT can be a single URL or a path to a file containing URLs (one per line).
 
+    By default, URLs are scraped sequentially with retry logic for rate limits.
+    Use --batch for faster parallel scraping (requires proxy infrastructure).
+
     Examples:
       firemd scrape https://example.com
       firemd scrape urls.txt --front-matter
+      firemd scrape urls.txt --delay 2.0 --max-retries 8
+      firemd scrape urls.txt --batch  # old parallel mode
     """
     do_scrape(
         input_=input_,
@@ -516,6 +727,10 @@ def scrape(
         overwrite=overwrite,
         server=server,
         lifecycle=lifecycle,
+        batch_mode=batch,
+        delay=delay,
+        max_retries=max_retries,
+        max_backoff=max_backoff,
     )
 
 
