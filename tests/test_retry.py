@@ -170,3 +170,4 @@ class TestErrorClassificationIntegration:
         assert result.success is False
         assert is_permanent_error(result.status_code) is False  # Should retry
 
+

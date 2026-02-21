@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def is_url(text: str) -> bool:
@@ -61,4 +62,24 @@ def get_output_dir(input_path: str | Path, explicit_out: str | None = None) -> P
     # If input is a file, output to directory named after file (without extension)
     input_path = Path(input_path)
     return Path.cwd() / input_path.stem
+
+
+def get_crawl_output_dir(url: str, explicit_out: str | None = None) -> Path:
+    """Determine output directory for a crawl based on the starting URL.
+
+    Uses the domain (hostname without port) as the directory name.
+
+    Args:
+        url: The starting crawl URL
+        explicit_out: Explicitly specified output directory
+
+    Returns:
+        Path to output directory
+    """
+    if explicit_out:
+        return Path(explicit_out)
+
+    parsed = urlparse(url)
+    domain = parsed.hostname or "unknown"
+    return Path.cwd() / domain
 

@@ -128,6 +128,16 @@ class BatchJob:
     status: str = "pending"
 
 
+@dataclass
+class CrawlJob:
+    """Represents a crawl job."""
+
+    job_id: str
+    total: int = 0
+    completed: int = 0
+    status: str = "pending"  # pending, scraping, completed, failed, cancelled
+
+
 class FirecrawlError(Exception):
     """Error from Firecrawl API."""
 
@@ -189,6 +199,8 @@ class FirecrawlClient:
                 response = self.client.get(f"{self.api_url}{endpoint}")
             elif method.upper() == "POST":
                 response = self.client.post(f"{self.api_url}{endpoint}", json=json)
+            elif method.upper() == "DELETE":
+                response = self.client.delete(f"{self.api_url}{endpoint}")
             else:
                 raise ValueError(f"Unsupported method: {method}")
             response.raise_for_status()
@@ -367,6 +379,302 @@ class FirecrawlClient:
             yield job, new_results
 
             # Check if done
+            if status in ("completed", "failed", "cancelled"):
+                break
+
+            time.sleep(poll_interval)
+
+    def start_crawl(
+        self,
+        url: str,
+        *,
+        limit: int = 1000,
+        max_depth: int = 10,
+        include_paths: list[str] | None = None,
+        exclude_paths: list[str] | None = None,
+        allow_backward_links: bool = False,
+        allow_external_links: bool = False,
+        allow_subdomains: bool = False,
+        ignore_sitemap: bool = False,
+        ignore_robots_txt: bool = False,
+        wait_for: int = 0,
+        max_concurrency: int = 1,
+        delay: float = 0,
+    ) -> CrawlJob:
+        """Start a crawl job.
+
+        Args:
+            url: Starting URL to crawl
+            limit: Maximum number of pages to crawl
+            max_depth: Maximum link depth to follow
+            include_paths: URL path patterns to include
+            exclude_paths: URL path patterns to exclude
+            allow_backward_links: Allow following links to parent pages
+            allow_external_links: Allow following external links
+            allow_subdomains: Allow following subdomain links
+            ignore_sitemap: Skip sitemap discovery
+            ignore_robots_txt: Ignore robots.txt rules
+            wait_for: Milliseconds to wait for JS rendering
+            max_concurrency: Maximum concurrent scrapes
+            delay: Seconds to pause between scrapes
+
+        Returns:
+            CrawlJob with job ID
+        """
+        body: dict[str, Any] = {
+            "url": url,
+            "limit": limit,
+            "maxDepth": max_depth,
+            "maxConcurrency": max_concurrency,
+            "scrapeOptions": {"formats": ["markdown"]},
+        }
+        if delay > 0:
+            body["delay"] = delay
+        if include_paths:
+            body["includePaths"] = include_paths
+        if exclude_paths:
+            body["excludePaths"] = exclude_paths
+        if allow_backward_links:
+            body["allowBackwardLinks"] = True
+        if allow_external_links:
+            body["allowExternalLinks"] = True
+        if allow_subdomains:
+            body["allowSubdomains"] = True
+        if ignore_sitemap:
+            body["ignoreSitemap"] = True
+        if ignore_robots_txt:
+            body["ignoreRobotsTxt"] = True
+        if wait_for > 0:
+            body["scrapeOptions"]["waitFor"] = wait_for
+
+        try:
+            response = self._make_request("POST", "/v1/crawl", json=body)
+            data = response.json()
+
+            if not data.get("success", False):
+                raise FirecrawlError(data.get("error", "Failed to start crawl"))
+
+            job_id = data.get("id", "")
+            if not job_id:
+                url_field = data.get("url", "")
+                if url_field:
+                    job_id = url_field.split("/")[-1]
+
+            return CrawlJob(job_id=job_id, status="pending")
+
+        except httpx.HTTPStatusError as e:
+            raise FirecrawlError(f"HTTP {e.response.status_code}: {e.response.text}")
+        except httpx.RequestError as e:
+            raise FirecrawlError(f"Request failed: {e}")
+
+    def cancel_crawl(self, job_id: str) -> None:
+        """Cancel a running crawl job (best-effort).
+
+        Args:
+            job_id: The crawl job ID to cancel
+        """
+        try:
+            self._make_request("DELETE", f"/v1/crawl/{job_id}")
+        except Exception:
+            pass  # Best-effort cancellation
+
+    def _ws_url(self) -> str:
+        """Derive WebSocket URL from API URL."""
+        if self.api_url.startswith("https://"):
+            return "wss://" + self.api_url[len("https://"):]
+        return "ws://" + self.api_url[len("http://"):]
+
+    def stream_crawl(
+        self,
+        job_id: str,
+        poll_interval: float = 2.0,
+    ) -> Iterator[tuple[CrawlJob, list[ScrapeResult]]]:
+        """Stream crawl results, trying WebSocket first, falling back to HTTP polling.
+
+        Args:
+            job_id: The crawl job ID
+            poll_interval: Seconds between polls (for HTTP fallback)
+
+        Yields:
+            Tuple of (CrawlJob status, list of new ScrapeResults)
+        """
+        try:
+            yield from self._stream_crawl_ws(job_id)
+        except Exception as e:
+            self._ws_error = str(e)
+            yield from self._poll_crawl(job_id, poll_interval)
+
+    @staticmethod
+    def _parse_doc(item: dict[str, Any]) -> ScrapeResult:
+        """Parse a single document dict into a ScrapeResult."""
+        metadata = item.get("metadata", {})
+        url = metadata.get("sourceURL", item.get("url", ""))
+        return ScrapeResult(
+            url=url,
+            markdown=item.get("markdown", ""),
+            title=metadata.get("title"),
+            description=metadata.get("description"),
+            source_url=metadata.get("sourceURL"),
+            status_code=metadata.get("statusCode"),
+            metadata=metadata,
+        )
+
+    def _stream_crawl_ws(
+        self,
+        job_id: str,
+    ) -> Iterator[tuple[CrawlJob, list[ScrapeResult]]]:
+        """Stream crawl results via WebSocket.
+
+        Connects to ws://.../v1/crawl/{job_id} and handles events:
+        - catchup: initial dump of all documents scraped so far
+        - document: single new page scraped in real-time
+        - done: crawl finished
+        - error: crawl failed
+
+        Args:
+            job_id: The crawl job ID
+
+        Yields:
+            Tuple of (CrawlJob status, list of new ScrapeResults)
+        """
+        import json as json_mod
+
+        import websocket
+
+        ws_url = f"{self._ws_url()}/v1/crawl/{job_id}"
+        ws = websocket.create_connection(ws_url, timeout=60)
+
+        job = CrawlJob(job_id=job_id, status="scraping")
+
+        try:
+            while True:
+                raw = ws.recv()
+                if not raw:
+                    continue
+
+                msg = json_mod.loads(raw)
+                event_type = msg.get("type", "")
+
+                if event_type == "document":
+                    result = self._parse_doc(msg.get("data", {}))
+                    job.completed += 1
+                    yield job, [result]
+
+                elif event_type == "catchup":
+                    data = msg.get("data", {})
+                    job.total = data.get("total", job.total)
+                    job.completed = data.get("completed", job.completed)
+                    job.status = data.get("status", job.status)
+                    # catchup includes all docs scraped before WS connected
+                    docs = data.get("data", [])
+                    results = [self._parse_doc(d) for d in docs if d]
+                    yield job, results
+
+                elif event_type == "done":
+                    job.status = "completed"
+                    yield job, []
+                    break
+
+                elif event_type == "error":
+                    job.status = "failed"
+                    yield job, []
+                    break
+
+        finally:
+            ws.close()
+
+    def _poll_crawl(
+        self,
+        job_id: str,
+        poll_interval: float = 2.0,
+    ) -> Iterator[tuple[CrawlJob, list[ScrapeResult]]]:
+        """Poll a crawl job via HTTP until completion.
+
+        Mirrors poll_batch() pattern with seen_urls set and pagination.
+
+        Args:
+            job_id: The crawl job ID
+            poll_interval: Seconds between polls
+
+        Yields:
+            Tuple of (CrawlJob status, list of new ScrapeResults)
+        """
+        seen_urls: set[str] = set()
+
+        while True:
+            try:
+                response = self._make_request("GET", f"/v1/crawl/{job_id}")
+                status_data = response.json()
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                raise FirecrawlError(f"Failed to poll crawl: {e}")
+
+            status = status_data.get("status", "unknown")
+            total = status_data.get("total", 0)
+            completed = status_data.get("completed", 0)
+            data_list = status_data.get("data", [])
+
+            job = CrawlJob(
+                job_id=job_id,
+                total=total,
+                completed=completed,
+                status=status,
+            )
+
+            new_results: list[ScrapeResult] = []
+            for item in data_list:
+                metadata = item.get("metadata", {})
+                url = metadata.get("sourceURL", item.get("url", ""))
+
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    new_results.append(
+                        ScrapeResult(
+                            url=url,
+                            markdown=item.get("markdown", ""),
+                            title=metadata.get("title"),
+                            description=metadata.get("description"),
+                            source_url=metadata.get("sourceURL"),
+                            status_code=metadata.get("statusCode"),
+                            metadata=metadata,
+                        )
+                    )
+
+            # Handle pagination
+            next_url = status_data.get("next")
+            while next_url:
+                try:
+                    # next_url is a full URL; extract the path
+                    from urllib.parse import urlparse as _urlparse
+
+                    parsed = _urlparse(next_url)
+                    endpoint = parsed.path
+                    if parsed.query:
+                        endpoint += f"?{parsed.query}"
+                    resp = self._make_request("GET", endpoint)
+                    page_data = resp.json()
+                except Exception:
+                    break
+
+                for item in page_data.get("data", []):
+                    metadata = item.get("metadata", {})
+                    url = metadata.get("sourceURL", item.get("url", ""))
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        new_results.append(
+                            ScrapeResult(
+                                url=url,
+                                markdown=item.get("markdown", ""),
+                                title=metadata.get("title"),
+                                description=metadata.get("description"),
+                                source_url=metadata.get("sourceURL"),
+                                status_code=metadata.get("statusCode"),
+                                metadata=metadata,
+                            )
+                        )
+                next_url = page_data.get("next")
+
+            yield job, new_results
+
             if status in ("completed", "failed", "cancelled"):
                 break
 
