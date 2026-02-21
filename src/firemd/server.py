@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path
-import re
-from typing import Literal
 
 import httpx
 from rich.console import Console
@@ -20,6 +18,8 @@ from firemd.config import (
     get_default_env_content,
     get_firecrawl_dir,
     get_state_dir,
+    load_proxy_url,
+    parse_proxy_url,
 )
 
 console = Console()
@@ -189,6 +189,7 @@ class ServerManager:
         # Write .env file
         env_file = self.firecrawl_dir / ".env"
         env_content = get_default_env_content(bull_auth_key)
+        env_content = self._inject_proxy(env_content)
         env_content = self._ensure_compose_env_vars(env_content)
         env_file.write_text(env_content)
         console.print(f"[dim]Wrote {env_file}[/dim]")
@@ -204,6 +205,38 @@ class ServerManager:
             except OSError:
                 # Not fatal; compose will still work if the file isn't picked up / is empty.
                 console.print(f"[yellow]Warning: could not remove {override_file}[/yellow]")
+
+    @staticmethod
+    def _inject_proxy(env_content: str) -> str:
+        """Replace empty PROXY_* placeholders with values from user config."""
+        proxy_url = load_proxy_url()
+        if not proxy_url:
+            return env_content
+
+        try:
+            parts = parse_proxy_url(proxy_url)
+        except ValueError:
+            return env_content
+
+        replacements = {
+            "PROXY_SERVER=": f"PROXY_SERVER={proxy_url}",
+            "PROXY_USERNAME=": f"PROXY_USERNAME={parts['username']}",
+            "PROXY_PASSWORD=": f"PROXY_PASSWORD={parts['password']}",
+        }
+
+        lines = env_content.splitlines()
+        new_lines = []
+        for line in lines:
+            stripped = line.strip()
+            replaced = False
+            for old_val, new_val in replacements.items():
+                if stripped == old_val:
+                    new_lines.append(new_val)
+                    replaced = True
+                    break
+            if not replaced:
+                new_lines.append(line)
+        return "\n".join(new_lines)
 
     def _ensure_compose_env_vars(self, env_content: str) -> str:
         """Ensure env_content defines all variables referenced by docker-compose.yaml.

@@ -7,7 +7,9 @@ Convert URLs to clean Markdown using a locally running [Firecrawl](https://githu
 ## Features
 
 - **Single URL scraping**: `firemd https://example.com`
+- **Website crawling**: `firemd crawl https://docs.example.com --limit 50`
 - **Batch scraping** from URL files with progress tracking
+- **Proxy support**: `firemd proxy http://user:pass@host:port`
 - **Auto server lifecycle**: starts Firecrawl on-demand, stops after scraping
 - **Smart resume**: skips already-processed URLs by default
 - **YAML front matter** option for metadata
@@ -78,6 +80,52 @@ firemd urls.txt
 # Force re-scrape all URLs (overwrite existing)
 firemd urls.txt --overwrite
 ```
+
+### 3) Crawling websites
+
+Crawl follows links automatically starting from a URL:
+
+```bash
+# Crawl a docs site (default: up to 1000 pages)
+firemd crawl https://docs.example.com --limit 50
+
+# Crawl with higher concurrency (useful with proxy)
+firemd crawl https://docs.example.com --limit 100 --concurrency 3
+
+# Crawl entire domain including subdomains
+firemd crawl https://example.com --entire-domain --limit 500
+
+# Filter by URL path patterns
+firemd crawl https://example.com --include "/docs/*" --exclude "/blog/*"
+
+# Keep server running after crawl
+firemd crawl https://docs.example.com --limit 50 --lifecycle keep
+```
+
+Output goes to a directory named after the domain (e.g., `docs.example.com/`).
+
+### 4) Proxy configuration
+
+For sites with anti-bot protection (403s), configure a proxy:
+
+```bash
+# Set proxy (saved to ~/.config/firemd/.env)
+firemd proxy http://user:pass@proxy.example.com:8080
+
+# Check current proxy config
+firemd proxy
+
+# Remove proxy
+firemd proxy --clear
+```
+
+After setting a proxy, reinstall the server config and restart:
+
+```bash
+firemd server install && firemd server up
+```
+
+The proxy is injected into Firecrawl's server-side config, so all scrape/crawl requests go through it.
 
 ### URL File Format
 
@@ -170,12 +218,14 @@ status_code: 200
 
 ```
 firemd [OPTIONS] <INPUT>
+firemd crawl <URL> [OPTIONS]
+firemd proxy [URL] [--clear]
 firemd server <COMMAND>
 
-Arguments:
+Scrape Arguments:
   INPUT              URL or path to file containing URLs
 
-Options:
+Scrape Options:
   --version  -V      Show version
   --help             Show help
   --out      -o      Output directory
@@ -185,6 +235,22 @@ Options:
   --overwrite -f     Re-scrape URLs even if already processed
   --server           Server policy: auto|never|always
   --lifecycle        After scrape: stop|down|keep
+  --delay            Max random delay between requests (default: 1.0s)
+  --max-retries      Retry attempts for transient errors (default: 5)
+
+Crawl Options:
+  --limit    -l      Maximum pages to crawl (default: 1000)
+  --max-depth -d     Maximum link depth (default: 10)
+  --concurrency -c   Max concurrent scrapes (default: 1)
+  --entire-domain    Crawl entire domain incl. subdomains
+  --include          URL path patterns to include (repeatable)
+  --exclude          URL path patterns to exclude (repeatable)
+  --wait             Milliseconds to wait for JS rendering
+
+Proxy Commands:
+  firemd proxy <URL>      Save proxy config
+  firemd proxy            Show current proxy config
+  firemd proxy --clear    Remove proxy config
 
 Server Commands:
   firemd server install   Install Firecrawl locally

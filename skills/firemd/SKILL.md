@@ -5,7 +5,7 @@ description: "Download websites and web pages as clean Markdown files using the 
 
 # firemd — Download Websites as Markdown
 
-Convert URLs to clean Markdown files using a locally running Firecrawl instance. Handles single URLs, batch URL lists, automatic server lifecycle, resume, and retry logic.
+Convert URLs to clean Markdown files using a locally running Firecrawl instance. Handles single URLs, website crawling, batch URL lists, proxy support, automatic server lifecycle, resume, and retry logic.
 
 ## Prerequisites
 
@@ -37,6 +37,26 @@ To include YAML front matter (url, title, scraped_at, status_code):
 firemd https://example.com --front-matter
 ```
 
+## Crawling a Website
+
+Crawl follows links automatically starting from a URL, saving each page as Markdown:
+
+```bash
+# Crawl a docs site (up to 50 pages)
+firemd crawl https://docs.example.com --limit 50
+
+# Crawl with higher concurrency (useful with proxy)
+firemd crawl https://docs.example.com --limit 100 --concurrency 3
+
+# Crawl entire domain including subdomains
+firemd crawl https://example.com --entire-domain --limit 500
+
+# Filter by URL path patterns
+firemd crawl https://example.com --include "/docs/*" --exclude "/blog/*"
+```
+
+Output goes to a directory named after the domain (e.g., `docs.example.com/`). Supports resume — re-running skips already-saved pages. Failed URLs are retried automatically after the crawl finishes.
+
 ## Batch Scraping from a URL List
 
 Create a text file with one URL per line (`#` comments and blank lines are ignored):
@@ -60,6 +80,29 @@ Key behaviors:
 - Use `--overwrite` (`-f`) to force re-scrape
 - Files are named `{index}_{host}_{path_slug}__{hash}.md` for batch mode
 
+## Proxy Configuration
+
+For sites with anti-bot protection (403 errors), configure a proxy:
+
+```bash
+# Set proxy (parses URL, saves to ~/.config/firemd/.env)
+firemd proxy http://user:pass@proxy.example.com:8080
+
+# Check current proxy
+firemd proxy
+
+# Remove proxy
+firemd proxy --clear
+```
+
+After setting a proxy, reinstall server config and restart:
+
+```bash
+firemd server install && firemd server up
+```
+
+The proxy is injected into Firecrawl's server-side `.env`, so all scrape/crawl requests go through it automatically.
+
 ## Useful Options
 
 | Flag | Effect |
@@ -72,6 +115,9 @@ Key behaviors:
 | `--max-retries N` | Retry attempts for transient errors (default: 5) |
 | `--server auto\|never\|always` | Server startup policy (default: auto) |
 | `--lifecycle stop\|down\|keep` | What to do with server after scrape (default: stop) |
+| `--limit N` / `-l N` | Max pages to crawl (default: 1000, crawl only) |
+| `--concurrency N` / `-c N` | Max concurrent scrapes (default: 1, crawl only) |
+| `--entire-domain` | Crawl entire domain incl. subdomains (crawl only) |
 
 ## Server Management
 
@@ -96,7 +142,7 @@ firemd https://example.com --server always
 - **Permanent errors** (403, 404, etc.) are logged to `errors.jsonl` and not retried
 - **Transient errors** (429, 5xx, network errors) are retried with exponential backoff
 - After the main pass, all retryable failures get a second attempt with a 30s cooldown
-- Re-running the same batch command automatically resumes from where it left off
+- Re-running the same batch/crawl command automatically resumes from where it left off
 
 ## Typical Workflow
 
@@ -107,7 +153,10 @@ bash SKILL_DIR/scripts/ensure_firemd.sh
 # 2. Single page
 firemd https://docs.example.com/page --out ./research/
 
-# 3. Batch: create URL list, then scrape
+# 3. Crawl an entire docs site
+firemd crawl https://docs.example.com --limit 100 --lifecycle keep
+
+# 4. Batch: create URL list, then scrape
 cat > urls.txt << 'EOF'
 https://docs.example.com/intro
 https://docs.example.com/guide
@@ -115,7 +164,7 @@ https://docs.example.com/reference
 EOF
 firemd urls.txt --out ./research/ --front-matter --verbose
 
-# 4. Check results
+# 5. Check results
 ls ./research/
 cat ./research/manifest.jsonl  # See status of each URL
 ```

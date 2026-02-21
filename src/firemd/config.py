@@ -39,6 +39,84 @@ def get_config_dir() -> Path:
     return Path(platformdirs.user_config_dir(APP_NAME))
 
 
+PROXY_ENV_FILE = ".env"
+
+
+def parse_proxy_url(url: str) -> dict[str, str]:
+    """Parse a proxy URL into components.
+
+    Accepts formats like:
+        http://host:port
+        http://user:pass@host:port
+
+    Returns:
+        Dict with host, port, username, password keys.
+
+    Raises:
+        ValueError: If the URL cannot be parsed or has no host.
+    """
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError(f"Invalid proxy URL (no host): {url}")
+
+    return {
+        "host": host,
+        "port": str(parsed.port) if parsed.port else "",
+        "username": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+    }
+
+
+def load_proxy_url() -> str:
+    """Load the saved proxy URL from ~/.config/firemd/.env.
+
+    Returns:
+        The proxy URL string, or empty string if not configured.
+    """
+    env_file = get_config_dir() / PROXY_ENV_FILE
+    if not env_file.exists():
+        return ""
+
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == "PROXY_URL":
+            return val.strip()
+
+    return ""
+
+
+def save_proxy_url(url: str) -> Path:
+    """Write proxy URL to ~/.config/firemd/.env.
+
+    Returns:
+        Path to the written file.
+    """
+    config_dir = get_config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    env_file = config_dir / PROXY_ENV_FILE
+    env_file.write_text(f"PROXY_URL={url}\n")
+    return env_file
+
+
+def clear_proxy_config() -> bool:
+    """Remove the proxy configuration file.
+
+    Returns:
+        True if a file was removed, False if it didn't exist.
+    """
+    env_file = get_config_dir() / PROXY_ENV_FILE
+    if env_file.exists():
+        env_file.unlink()
+        return True
+    return False
+
+
 # Default .env content for Firecrawl
 def get_default_env_content(bull_auth_key: str) -> str:
     """Generate default .env content for Firecrawl."""

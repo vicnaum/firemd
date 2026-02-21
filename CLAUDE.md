@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is firemd
 
-firemd is a CLI tool that converts URLs to clean Markdown using a locally running [Firecrawl](https://github.com/mendableai/firecrawl) instance via Docker Compose. It supports single URL scraping, batch scraping from URL files, automatic server lifecycle management, smart resume via JSONL manifests, and retry logic with exponential backoff.
+firemd is a CLI tool that converts URLs to clean Markdown using a locally running [Firecrawl](https://github.com/mendableai/firecrawl) instance via Docker Compose. It supports single URL scraping, website crawling, batch scraping from URL files, proxy configuration, automatic server lifecycle management, smart resume via JSONL manifests, and retry logic with exponential backoff.
 
 ## Commands
 
@@ -35,12 +35,12 @@ All source code is in `src/firemd/` using a `src`-layout with hatchling as the b
 
 ### Module responsibilities
 
-- **cli.py** — Typer CLI with two command groups: `scrape` (default command, also triggered by passing a URL/file directly) and `server` (subcommands: install, up, stop, down, status, logs, doctor). The `main()` function auto-inserts `scrape` when the first arg isn't a known subcommand or flag.
+- **cli.py** — Typer CLI with commands: `scrape` (default command, also triggered by passing a URL/file directly), `crawl` (website crawling with link following), `proxy` (configure proxy URL), and `server` (subcommands: install, up, stop, down, status, logs, doctor). The `main()` function auto-inserts `scrape` when the first arg isn't a known subcommand or flag.
 - **firecrawl.py** — `FirecrawlClient` HTTP client (context manager) for the Firecrawl v1 API. Handles single scrape (`POST /v1/scrape`), batch scrape (`POST /v1/batch/scrape` + polling), and sequential scraping with per-URL retry. Contains `with_retry()` generic retry helper, `is_permanent_error()` and `is_success()` classifiers, and data classes `ScrapeResult` and `BatchJob`.
 - **server.py** — `ServerManager` wraps Docker Compose operations for the Firecrawl stack. Key method: `ensure()` starts the server if needed and returns whether the caller should stop it later. Stores Firecrawl in `~/.local/share/firemd/firecrawl/` (via platformdirs).
 - **outputs.py** — Filename generation (`make_filename`) using `{index_}{host}_{path_slug}__{sha1_hash}.md` scheme, and `write_markdown()` with optional YAML front matter.
 - **manifest.py** — JSONL manifest for tracking scrape progress (`manifest.jsonl`) and permanent errors (`errors.jsonl`). Enables resume: on re-run, URLs with `status: "ok"` and 2xx `http_status` are skipped.
-- **config.py** — Constants (API URL defaults, health endpoint, repo URL) and platformdirs-based path helpers.
+- **config.py** — Constants (API URL defaults, health endpoint, repo URL), platformdirs-based path helpers, and proxy configuration (parse/load/save/clear proxy URL from `~/.config/firemd/.env`).
 - **util.py** — `is_url()` detection, `parse_url_file()` for reading URL lists, `get_output_dir()` logic.
 
 ### Key data flow
